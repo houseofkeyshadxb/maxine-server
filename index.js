@@ -407,5 +407,69 @@ app.post('/chat', async (req, res) => {
   res.json({ reply });
 });
 
+
+// ── TELEGRAM AUTO-REPLY (long polling) ──
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const tgHistories = new Map(); // chatId -> recent history
+const tgSleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function tgApi(method, body) {
+  const res = await fetch(`https://api.telegram.org/bot${TG_TOKEN}/${method}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  return res.json();
+}
+
+async function startTelegramPolling() {
+  console.log('Telegram auto-reply: listening for incoming messages...');
+  let offset = 0;
+  // Skip any stale backlog from before this deploy
+  try {
+    const drop = await (await fetch(`https://api.telegram.org/bot${TG_TOKEN}/getUpdates?offset=-1`)).json();
+    if (drop.result && drop.result.length) offset = drop.result[drop.result.length - 1].update_id + 1;
+  } catch (e) { console.warn('TG initial fetch failed:', e.message); }
+
+  while (true) {
+    try {
+      const data = await (await fetch(`https://api.telegram.org/bot${TG_TOKEN}/getUpdates?timeout=25&offset=${offset}`)).json();
+      const updates = data.result || [];
+      for (const upd of updates) {
+        offset = upd.update_id + 1;
+        const msg = upd.message || upd.edited_message;
+        if (!msg || !msg.text) continue;
+        if (msg.from && msg.from.is_bot) continue;
+        const chatId = String(msg.chat.id);
+        const text = msg.text.trim();
+        const history = tgHistories.get(chatId) || [];
+        try {
+          const r = await fetch(`http://localhost:${PORT}/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ message: text, history, sessionId: `tg-${chatId}`, channel: 'telegram' })
+          });
+          const out = await r.json();
+          const reply = out.reply || "I'm sorry, I can't respond right now. Please try again shortly.";
+          history.push({ role: 'user', content: text }, { role: 'assistant', content: reply });
+          tgHistories.set(chatId, history.slice(-12));
+          await tgApi('sendMessage', { chat_id: chatId, text: reply });
+          console.log('TG reply sent to', chatId);
+        } catch (err) {
+          console.warn('TG handler error:', err.message);
+          try { await tgApi('sendMessage', { chat_id: chatId, text: "One moment please — I'll be right with you." }); } catch (_) {}
+        }
+      }
+    } catch (err) {
+      console.warn('TG polling error:', err.message);
+      await tgSleep(3000);
+    }
+  }
+}
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Maxine server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Maxine server running on port ${PORT}`);
+  if (TG_TOKEN) startTelegramPolling();
+  else console.log('TELEGRAM_BOT_TOKEN not set — Telegram auto-reply disabled');
+});
